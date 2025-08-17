@@ -1,5 +1,4 @@
 streamlit
-opencv-python
 opencv-python-headless==4.8.0.74
 mediapipe==0.10.14
 protobuf==3.20.*
