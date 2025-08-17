@@ -2,4 +2,4 @@ streamlit
 opencv-python-headless==4.8.0.74
 mediapipe==0.10.14
 protobuf>=4.25.3,<5
-numpy
+numpy<2.0.0  # Important: MediaPipe isn't yet compatible with NumPy 2.0
