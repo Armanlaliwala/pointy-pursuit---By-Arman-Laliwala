@@ -40,7 +40,7 @@ def main():
     st.title("🎯 Fingertip Catch Game")
     st.markdown("Use your finger to catch falling balls!")
     
-    # Initialize game state in session state
+    # Initialize game state
     if 'game' not in st.session_state:
         st.session_state.game = {
             'score': 0,
@@ -48,7 +48,8 @@ def main():
             'balls': deque(),
             'last_spawn': time.time(),
             'game_over': False,
-            'started': False
+            'started': False,
+            'camera_error': False
         }
     
     # Initialize MediaPipe Hands
@@ -60,18 +61,32 @@ def main():
         model_complexity=0
     )
     
-    # Camera input
-    img_placeholder = st.empty()
-    cap = cv2.VideoCapture(0)
+    # Camera setup with error handling
+    cap = None
+    try:
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            st.session_state.game['camera_error'] = True
+            st.error("Could not access camera. Please ensure camera permissions are granted.")
+            return
+    except Exception as e:
+        st.session_state.game['camera_error'] = True
+        st.error(f"Camera error: {str(e)}")
+        return
     
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            st.error("Failed to capture video")
-            break
-            
-        frame = cv2.flip(frame, 1)
+    img_placeholder = st.empty()
+    
+    while True:
+        # Create a blank frame as fallback
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
         h, w = frame.shape[:2]
+        
+        # Try to read camera frame
+        if not st.session_state.game['camera_error']:
+            ret, camera_frame = cap.read()
+            if ret:
+                frame = cv2.flip(camera_frame, 1)
+                h, w = frame.shape[:2]
         
         # Process hands
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -131,13 +146,11 @@ def main():
             img_placeholder.image(frame, channels="BGR")
             continue
         
-        # Spawn balls
+        # Game logic
         now = time.time()
         if now - st.session_state.game['last_spawn'] > SPAWN_INTERVAL:
-            color = random.choices(
-                list(PROBABILITIES.keys()), 
-                weights=list(PROBABILITIES.values())
-            )[0]
+            color = random.choices(list(PROBABILITIES.keys()), 
+                                 weights=list(PROBABILITIES.values()))[0]
             r = random.randint(*BALL_RADIUS_RANGE)
             x = random.randint(r, w-r)
             vy = random.uniform(*BALL_SPEED_RANGE)
@@ -146,7 +159,6 @@ def main():
             )
             st.session_state.game['last_spawn'] = now
         
-        # Update balls
         for ball in list(st.session_state.game['balls']):
             ball.update()
             ball.draw(frame)
@@ -176,8 +188,12 @@ def main():
                     (230,35), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
         
         img_placeholder.image(frame, channels="BGR")
+        
+        # Small delay to prevent high CPU usage
+        time.sleep(0.01)
     
-    cap.release()
+    if cap:
+        cap.release()
 
 if __name__ == "__main__":
     main()
