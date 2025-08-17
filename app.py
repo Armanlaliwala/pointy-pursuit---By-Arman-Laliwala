@@ -1,8 +1,9 @@
 import cv2
 import time
 import random
+import threading
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 import mediapipe as mp
 
 # ==== Game Parameters ====
@@ -41,36 +42,48 @@ def weighted_choice(d):
 # ==== Streamlit Video Processor ====
 class GameProcessor(VideoTransformerBase):
     def __init__(self):
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            max_num_hands=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-            model_complexity=0
-        )
+        self._lock = threading.Lock()
+        self._model_initialized = False
         self.reset_game()
-        self.started = False  # game starts only after pressing Start
+        self.started = False
+
+    def _init_model(self):
+        if not self._model_initialized:
+            with self._lock:
+                if not self._model_initialized:
+                    self.mp_hands = mp.solutions.hands
+                    self.hands = self.mp_hands.Hands(
+                        max_num_hands=1,
+                        min_detection_confidence=0.5,
+                        min_tracking_confidence=0.5,
+                        model_complexity=0
+                    )
+                    self._model_initialized = True
 
     def reset_game(self):
-        self.score, self.misses, self.balls = 0, 0, []
-        self.last_spawn_time, self.spawn_jitter = time.time(), 0.0
-        self.game_over = False
+        with self._lock:
+            self.score, self.misses, self.balls = 0, 0, []
+            self.last_spawn_time, self.spawn_jitter = time.time(), 0.0
+            self.game_over = False
 
     def transform(self, frame):
+        self._init_model()  # Lazy initialization
+        
         img = frame.to_ndarray(format="bgr24")
-        img = cv2.flip(img, 1)   # Fix mirror
+        img = cv2.flip(img, 1)  # Fix mirror
 
         h, w = img.shape[:2]
         now = time.time()
 
         # Detect fingertip
         fingertip = None
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        result = self.hands.process(rgb)
-        if result.multi_hand_landmarks:
-            tip = result.multi_hand_landmarks[0].landmark[8]
-            fingertip = (int(tip.x * w), int(tip.y * h))
-            cv2.circle(img, fingertip, 8, (255, 255, 255), -1)
+        with self._lock:
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            result = self.hands.process(rgb)
+            if result.multi_hand_landmarks:
+                tip = result.multi_hand_landmarks[0].landmark[8]
+                fingertip = (int(tip.x * w), int(tip.y * h))
+                cv2.circle(img, fingertip, 8, (255, 255, 255), -1)
 
         # === Start Screen ===
         if not self.started:
@@ -96,26 +109,28 @@ class GameProcessor(VideoTransformerBase):
             r = random.randint(*BALL_RADIUS_RANGE)
             x = random.randint(r, w-r)
             vy = random.uniform(*BALL_SPEED_RANGE)
-            self.balls.append(Ball(x, -r, r, COLOR_MAP[cname], vy, BALL_POINTS[cname]))
-            self.last_spawn_time, self.spawn_jitter = now, random.uniform(-0.25, 0.25) * SPAWN_INTERVAL_SEC
+            with self._lock:
+                self.balls.append(Ball(x, -r, r, COLOR_MAP[cname], vy, BALL_POINTS[cname]))
+                self.last_spawn_time, self.spawn_jitter = now, random.uniform(-0.25, 0.25) * SPAWN_INTERVAL_SEC
 
         # === Update balls ===
-        for ball in self.balls:
-            if not ball.alive: continue
-            ball.update()
-            ball.draw(img)
-            if fingertip:
-                dx, dy = fingertip[0]-ball.x, fingertip[1]-ball.y
-                if dx*dx + dy*dy <= (ball.r+8)**2:
-                    self.score += ball.points
+        with self._lock:
+            for ball in self.balls:
+                if not ball.alive: continue
+                ball.update()
+                ball.draw(img)
+                if fingertip:
+                    dx, dy = fingertip[0]-ball.x, fingertip[1]-ball.y
+                    if dx*dx + dy*dy <= (ball.r+8)**2:
+                        self.score += ball.points
+                        ball.alive = False
+                if ball.alive and ball.y - ball.r > h:
+                    self.misses += 1
                     ball.alive = False
-            if ball.alive and ball.y - ball.r > h:
-                self.misses += 1
-                ball.alive = False
 
-        self.balls = [b for b in self.balls if b.alive]
-        if self.misses >= MAX_MISSES:
-            self.game_over = True
+            self.balls = [b for b in self.balls if b.alive]
+            if self.misses >= MAX_MISSES:
+                self.game_over = True
 
         # === HUD ===
         cv2.rectangle(img, (0,0), (w,50), (0,0,0), -1)
@@ -135,8 +150,9 @@ class GameProcessor(VideoTransformerBase):
             cv2.putText(img, "RESTART", (bx+20, by+55), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 3)
 
             if fingertip and bx < fingertip[0] < bx+bw and by < fingertip[1] < by+bh:
-                self.reset_game()
-                self.started = True
+                with self._lock:
+                    self.reset_game()
+                    self.started = True
 
         return img
 
@@ -144,8 +160,15 @@ class GameProcessor(VideoTransformerBase):
 st.title("🎯 Fingertip Catch Game (Web Version)")
 st.markdown("Move your index finger to catch falling balls. Miss 3 = Game Over!")
 
-webrtc_streamer(
-    key="game",
-    video_transformer_factory=GameProcessor,
-    media_stream_constraints={"video": True, "audio": False}
-)
+# Add loading state and async processing
+with st.spinner('Initializing camera... Please wait up to 45 seconds'):
+    webrtc_streamer(
+        key="game",
+        video_transformer_factory=GameProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration={
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        }
+    )
